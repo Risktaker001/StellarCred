@@ -79,6 +79,7 @@ import { parseCorsOrigins } from "./config";
 import { createCorsMiddleware } from "./cors";
 import { RateLimiter } from "./rate-limit";
 import type { RecentCursor } from "./db";
+import { requireAuth } from "./auth";
 
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
@@ -213,6 +214,14 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   const rateLimiter = new RateLimiter({ windowMs, max, enabled });
   app.locals["rateLimiter"] = rateLimiter;
   app.use(rateLimiter.middleware());
+
+  // ── Auth guard ───────────────────────────────────────────────────────────
+  // requireAuth(undefined) → no-op; public mode, all endpoints open (default).
+  // requireAuth("secret")  → enforces Bearer / X-API-Key on guarded routes.
+  // Resolved from config first so tests can inject the key directly without
+  // touching the environment.
+  const apiKey = config?.apiKey ?? process.env["API_KEY"]?.trim() || undefined;
+  const guard = requireAuth(apiKey);
 
   // ── GET /health ──────────────────────────────────────────────────────────
   // Exposes ingester lag so operators can alert when the indexer falls behind.

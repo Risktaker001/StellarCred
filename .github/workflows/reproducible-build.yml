@@ -31,13 +31,19 @@ on:
       - 'docker/Dockerfile.reproducible'
       - '.github/workflows/reproducible-build.yml'
 
+# ── Security: least-privilege permissions ──────────────────────────────────
+# contents:read – checkout source for Docker build. No secrets are used;
+# this workflow only compiles and compares WASM hashes.
+permissions:
+  contents: read
+
 jobs:
   reproducible-build:
     name: Build twice, compare hashes
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ── Build the reproducible Docker image ──────────────────────────────
       # The image installs the compiler and pre-fetches all Cargo deps but
@@ -120,14 +126,14 @@ jobs:
 
       # ── Upload artifacts for independent inspection ───────────────────────
       - name: Upload WASM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wasm-artifacts-${{ github.sha }}
           path: build-1/*.wasm
           retention-days: 30
 
       - name: Upload SHA-256 manifest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wasm-sha256-${{ github.sha }}
           path: build-1/sha256sums.txt

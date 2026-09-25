@@ -51,11 +51,16 @@ fn main(
     num_credentials: pub Field,
 ) {
     // -- Verify KYC credential ----------------------------------------------
+    // See circuits/lib/src/lib.nr for why this must be asserted non-zero:
+    // it blocks the degenerate case where an unsalted commitment becomes a
+    // brute-forceable hash of a low-entropy value.
+    assert(kyc_salt != 0);
     assert(Poseidon2::hash([kyc_secret, kyc_salt], 2) == kyc_commitment);
     let kyc_z: [u8; 32] = kyc_commitment.to_be_bytes();
     assert(verify_signature(kyc_issuer_x, kyc_issuer_y, kyc_sig, kyc_z));
 
     // -- Verify age credential ----------------------------------------------
+    assert(age_salt != 0);
     assert(Poseidon2::hash([age_date_of_birth as Field, age_salt], 2) == age_commitment);
     let age_z: [u8; 32] = age_commitment.to_be_bytes();
     assert(verify_signature(age_issuer_x, age_issuer_y, age_sig, age_z));
@@ -65,4 +70,99 @@ fn main(
 
     // -- Metadata constraint ------------------------------------------------
     assert(num_credentials == 2);
+}
+
+// --- Tests ---------------------------------------------------------------
+// Run: nargo test --package aggregate_proof
+
+// fails on the salt != 0 assert before the signature check is reached
+#[test(should_fail)]
+fn test_zero_kyc_salt_rejected() {
+    let zero_sig: [u8; 64] = [0; 64];
+    let zero_x: [u8; 32] = [0; 32];
+    let zero_y: [u8; 32] = [0; 32];
+
+    main(
+        1, 0, zero_sig, 0, zero_x, zero_y, // kyc: salt = 0
+        20000101, 1, zero_sig, 0, zero_x, zero_y, 20240101, 18,
+        2,
+    );
+}
+
+// fails on the salt != 0 assert before the signature check is reached
+#[test(should_fail)]
+fn test_zero_age_salt_rejected() {
+    let zero_sig: [u8; 64] = [0; 64];
+    let zero_x: [u8; 32] = [0; 32];
+    let zero_y: [u8; 32] = [0; 32];
+
+    main(
+        1, 1, zero_sig, 0, zero_x, zero_y,
+        20000101, 0, zero_sig, 0, zero_x, zero_y, 20240101, 18, // age: salt = 0
+        2,
+    );
+}
+
+// --- Property-based boundary tests (logic-only) --------------------------
+// Test the age constraint logic independently: `age_years >= threshold_years`
+// where `age_years = (current_date - date_of_birth) / 365`.
+
+// Exact boundary: age exactly at threshold.
+#[test]
+fn test_boundary_age_exact_threshold() {
+    let dob: u64 = 10000;
+    let threshold: u64 = 18;
+    let current: u64 = dob + threshold * 365;
+    assert(current >= dob);
+    let age_years = (current - dob) / 365;
+    assert(age_years >= threshold);
+}
+
+// Off-by-one below: age one day short of threshold.
+#[test(should_fail)]
+fn test_boundary_age_one_day_below() {
+    let dob: u64 = 10000;
+    let threshold: u64 = 18;
+    let current: u64 = dob + threshold * 365 - 1;
+    assert(current >= dob);
+    let age_years = (current - dob) / 365;
+    assert(age_years >= threshold);
+}
+
+// Off-by-one above.
+#[test]
+fn test_boundary_age_one_day_above() {
+    let dob: u64 = 10000;
+    let threshold: u64 = 18;
+    let current: u64 = dob + threshold * 365 + 1;
+    assert(current >= dob);
+    let age_years = (current - dob) / 365;
+    assert(age_years >= threshold);
+}
+
+// num_credentials must equal 2.
+#[test(should_fail)]
+fn test_invalid_num_credentials() {
+    let n: Field = 3;
+    assert(n == 2);
+}
+
+#[test]
+fn test_valid_num_credentials() {
+    let n: Field = 2;
+    assert(n == 2);
+}
+
+// Multiple threshold sweep for the age constraint.
+#[test]
+fn test_boundary_age_threshold_sweep() {
+    let dob: u64 = 5000;
+    let thresholds: [u64; 4] = [1, 18, 21, 65];
+    for i in 0..4 {
+        let t = thresholds[i];
+        let current = dob + t * 365;
+        assert(current >= dob);
+        let age_years = (current - dob) / 365;
+        assert(age_years >= t);
+    }
 }

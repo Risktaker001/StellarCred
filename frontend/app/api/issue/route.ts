@@ -16,6 +16,13 @@ import {
 import { env } from "../../../lib/env";
 import { fetchPlaidBalance } from "../../../lib/plaid";
 import {
+  checkLimit,
+  extractIp,
+  hashForLog,
+  tooManyRequestsResponse,
+  LIMITS,
+} from "../../../lib/rate-limit";
+import {
   idempotencyGet,
   idempotencySet,
   idempotencyInFlightBegin,
@@ -25,6 +32,12 @@ import {
   MAX_KEY_LENGTH_BYTES,
   type CachedResponse,
 } from "../../../lib/idempotency";
+import {
+  auditLogAppend,
+  auditLogBootstrap,
+  auditLogFilePath,
+  auditLogPersist,
+} from "../../../lib/audit-log";
 
 // Server-side only — never shipped to the browser.
 // Set ISSUER_PRIVATE_KEY in .env.local to the 64-char hex secp256k1 private
@@ -246,6 +259,30 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // ── Rate limiting ────────────────────────────────────────────────────────
+  // Applied after idempotency: a request that hits the idempotency cache is
+  // already free — it's a replay, not a new issuance. New requests (including
+  // the first leg of a Persona KYC redirect flow) count against both the IP
+  // and, when the wallet address is available in the URL params, the wallet
+  // limit. The wallet address from the body is checked separately inside
+  // executeRequest once the body is parsed; the pre-body IP check is cheap and
+  // blocks floods before any body is read.
+  const ip = extractIp(req);
+  const windowMs = LIMITS.windowMs();
+  const ipResult = checkLimit(`issue:ip:${ip}`, LIMITS.issuePerIp(), windowMs);
+  if (ipResult.throttled) {
+    logger.warn(
+      stripSensitiveFields({
+        event: "rate_limited",
+        route: "issue",
+        dimension: "ip",
+        ipToken: hashForLog(ip),
+        requestId,
+      }),
+    );
+    return tooManyRequestsResponse(ipResult.retryAfterMs);
+  }
+
   try {
     return await executeRequest(req, requestId, idempotencyKey);
   } catch (e) {
@@ -348,6 +385,29 @@ async function executeRequest(
   } = body;
   issuerId = reqIssuerId;
   walletAddress = holder;
+
+  // ── Per-wallet rate limit ────────────────────────────────────────────────
+  // Checked here (after body parse) because the wallet address lives in the
+  // body. Returns 429 before any provider call or signing work is started.
+  if (holder) {
+    const walletResult = checkLimit(
+      `issue:wallet:${holder}`,
+      LIMITS.issuePerWallet(),
+      LIMITS.windowMs(),
+    );
+    if (walletResult.throttled) {
+      logger.warn(
+        stripSensitiveFields({
+          event: "rate_limited",
+          route: "issue",
+          dimension: "wallet",
+          walletToken: hashForLog(holder),
+          requestId,
+        }),
+      );
+      return sendResponse(tooManyRequestsResponse(walletResult.retryAfterMs));
+    }
+  }
 
   // Normalize to the multi-claim shape. Legacy callers send { type, attribute };
   // map that single attribute onto the right key in `attributes`.
@@ -622,6 +682,49 @@ async function executeRequest(
         }),
       );
     }
+
+    // ── Hash-chained, PII-free issuance audit log ───────────────────────────
+    // Append one entry per signed commitment. Entries carry ONLY the
+    // commitment (a Poseidon2 hash — not the underlying attribute), the
+    // issuer id, the issuance timestamp, and the request id — never
+    // first_name/last_name/id_number/wallet address. Each entry chains to the
+    // previous entry's hash so tampering is detectable via the
+    // `pnpm verify:audit-log` command (docs/audit-log.md).
+    try {
+      await auditLogBootstrap(auditLogFilePath());
+      for (const credential of credentials) {
+        const entry = auditLogAppend({
+          timestamp: credential.issuedAt,
+          requestId,
+          issuer: issuerId ?? "",
+          commitment: credential.commitment,
+        });
+        logger.info(
+          stripSensitiveFields({
+            event: "audit_log_appended",
+            credentialType: credential.type,
+            issuerId,
+            requestId,
+            auditIndex: entry.index,
+            auditHash: entry.hash,
+          }),
+        );
+      }
+      await auditLogPersist(auditLogFilePath());
+    } catch (auditError) {
+      // The audit log must never break issuance; surface the failure loudly
+      // so operators know the trail is incomplete.
+      logger.error(
+        stripSensitiveFields({
+          event: "audit_log_persist_failed",
+          issuerId,
+          walletAddress,
+          error: (auditError as Error).message,
+          requestId,
+        }),
+      );
+    }
+
     outcome = "success";
     return sendResponse(NextResponse.json({ credentials }));
   } catch (e) {

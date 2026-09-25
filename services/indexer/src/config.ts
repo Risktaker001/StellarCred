@@ -30,19 +30,6 @@ export interface Config {
   rateLimitWindowMs: number;
   rateLimitMax: number;
   rateLimitEnabled: boolean;
-  /**
-   * When set, every claim endpoint (GET /claims, /stats, /recent) requires
-   * callers to supply the matching secret as either:
-   *   - HTTP header:  Authorization: Bearer <key>
-   *   - HTTP header:  X-API-Key: <key>
-   *
-   * Absent or empty → public mode (no auth enforced on any endpoint).
-   * The value must be kept secret; treat it like a password.
-   *
-   * See services/indexer/README.md §Authentication for guidance on when to
-   * enable this and how to restrict CORS alongside it.
-   */
-  apiKey: string | undefined;
 }
 
 function required(name: string): string {
@@ -119,8 +106,6 @@ export function loadConfig(): Config {
   const rateLimitEnabled =
     optional("RATE_LIMIT_ENABLED", "true").toLowerCase() !== "false";
 
-  const rawApiKey = process.env["API_KEY"]?.trim();
-
   return {
     stellarNetwork: network,
     horizonUrl: envHorizon ?? preset.horizonUrl,
@@ -139,6 +124,5 @@ export function loadConfig(): Config {
     rateLimitWindowMs: (Number.isFinite(windowSec) && windowSec > 0 ? windowSec : 60) * 1000,
     rateLimitMax: Number.isFinite(maxReq) && maxReq > 0 ? maxReq : 120,
     rateLimitEnabled,
-    apiKey: rawApiKey || undefined,
   };
 }

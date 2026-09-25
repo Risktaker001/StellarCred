@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 const isVerified = vi.fn();
 const checkClaim = vi.fn();
 
-vi.mock("../../proof-registry/src/index.js", () => ({
+vi.mock("../../proof-registry/src/index", () => ({
   Client: vi.fn(function ProofRegistryClient() {
     return {
       is_verified: isVerified,
@@ -14,13 +14,20 @@ vi.mock("../../proof-registry/src/index.js", () => ({
 
 vi.mock("@stellar/stellar-sdk", () => ({
   rpc: {},
+  StrKey: {
+    isValidEd25519PublicKey: vi.fn(
+      (address: string) => address === "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+    ),
+  },
 }));
 
 import {
   configure,
   hasClaim,
   getClaims,
+  verifyPreset,
   ConfigError,
+  InvalidAddressError,
   RpcError,
   TimeoutError,
   StellarCred,
@@ -35,8 +42,72 @@ describe("error taxonomy exports", () => {
     expect(StellarCred.ConfigError).toBe(ConfigError);
     expect(StellarCred.RpcError).toBe(RpcError);
     expect(StellarCred.TimeoutError).toBe(TimeoutError);
+    expect(StellarCred.InvalidAddressError).toBe(InvalidAddressError);
     expect(new ConfigError().name).toBe("ConfigError");
     expect(new RpcError().name).toBe("RpcError");
+    expect(new InvalidAddressError().name).toBe("InvalidAddressError");
+  });
+});
+
+describe("hasClaim — address validation", () => {
+  beforeEach(() => {
+    isVerified.mockReset();
+    checkClaim.mockReset();
+    configure({ registryId: "C_TEST_REGISTRY" });
+  });
+
+  it("returns false for an invalid Stellar address without making an RPC call", async () => {
+    await expect(hasClaim("invalid-address", "kyc")).resolves.toBe(false);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+
+  it("returns false for an empty address without making an RPC call", async () => {
+    await expect(hasClaim("", "kyc")).resolves.toBe(false);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+
+  it("returns false for a whitespace-only address without making an RPC call", async () => {
+    await expect(hasClaim("   ", "kyc")).resolves.toBe(false);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+
+  it("trims a valid Stellar address before making the RPC call", async () => {
+    isVerified.mockResolvedValue({
+      result: [true, 1_700_000_000n, 1_800_000_000n],
+    });
+
+    await expect(hasClaim(`  ${WALLET}  `, "kyc")).resolves.toBe(true);
+
+    expect(isVerified).toHaveBeenCalledTimes(1);
+    expect(isVerified).toHaveBeenCalledWith({
+      holder: WALLET,
+      credential_type: "kyc",
+      trusted_issuers: undefined,
+    });
+  });
+
+  it("throws InvalidAddressError for an invalid address when throwOnError is enabled", async () => {
+    await expect(
+      hasClaim("invalid-address", "kyc", { throwOnError: true }),
+    ).rejects.toBeInstanceOf(InvalidAddressError);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+
+  it("does not make an RPC call for an invalid threshold claim", async () => {
+    await expect(
+      hasClaim("invalid-address", "age", { minThreshold: 21 }),
+    ).resolves.toBe(false);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
   });
 });
 
@@ -189,6 +260,37 @@ describe("read request timeout", () => {
   });
 });
 
+describe("getClaims — address validation", () => {
+  beforeEach(() => {
+    isVerified.mockReset();
+    checkClaim.mockReset();
+    configure({ registryId: "C_TEST_REGISTRY" });
+  });
+
+  it("returns an empty list for an invalid address without making RPC calls", async () => {
+    await expect(getClaims("invalid-address")).resolves.toEqual([]);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+
+  it("returns an empty list for an empty address without making RPC calls", async () => {
+    await expect(getClaims("")).resolves.toEqual([]);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+
+  it("throws InvalidAddressError when getClaims receives an invalid address and throwOnError is enabled", async () => {
+    await expect(
+      getClaims("invalid-address", { throwOnError: true }),
+    ).rejects.toBeInstanceOf(InvalidAddressError);
+
+    expect(isVerified).not.toHaveBeenCalled();
+    expect(checkClaim).not.toHaveBeenCalled();
+  });
+});
+
 describe("getClaims — throwOnError", () => {
   beforeEach(() => {
     isVerified.mockReset();
@@ -278,5 +380,68 @@ describe("SDK withRetry with exponential backoff", () => {
     expect(error).toBeDefined();
     expect(error.message).toBe("network error");
     expect(operation).toHaveBeenCalledTimes(4); // initial + 3 retries
+  });
+});
+
+// ── verifyPreset (#386) ──────────────────────────────────────────────────────
+
+describe("verifyPreset", () => {
+  beforeEach(() => {
+    isVerified.mockReset();
+    checkClaim.mockReset();
+    configure({ registryId: "C_TEST_REGISTRY" });
+  });
+
+  it("is allValid when every claim in the preset passes", async () => {
+    isVerified.mockResolvedValue({ result: [true, 1_700_000_000n, 1_800_000_000n] });
+
+    const { allValid, results } = await verifyPreset(WALLET, [
+      { type: "kyc" },
+      { type: "jurisdiction" },
+    ]);
+
+    expect(allValid).toBe(true);
+    expect(results).toEqual({ kyc: true, jurisdiction: true });
+  });
+
+  it("is not allValid when any single claim fails, but still reports every result", async () => {
+    isVerified.mockImplementation(async ({ credential_type }: { credential_type: string }) => ({
+      result: [credential_type === "kyc", 1_700_000_000n, 1_800_000_000n],
+    }));
+
+    const { allValid, results } = await verifyPreset(WALLET, [
+      { type: "kyc" },
+      { type: "jurisdiction" },
+    ]);
+
+    expect(allValid).toBe(false);
+    expect(results).toEqual({ kyc: true, jurisdiction: false });
+  });
+
+  it("routes a thresholded claim through check_claim with the preset's minThreshold", async () => {
+    checkClaim.mockResolvedValue({ result: true });
+
+    const { allValid } = await verifyPreset(WALLET, [
+      { type: "accreditation", minThreshold: 1_000_000 },
+    ]);
+
+    expect(allValid).toBe(true);
+    expect(checkClaim).toHaveBeenCalledWith(
+      expect.objectContaining({
+        credential_type: "accreditation",
+        min_threshold: 1_000_000n,
+      }),
+    );
+  });
+
+  it("is not allValid for an empty preset", async () => {
+    const { allValid, results } = await verifyPreset(WALLET, []);
+    expect(allValid).toBe(false);
+    expect(results).toEqual({});
+    expect(isVerified).not.toHaveBeenCalled();
+  });
+
+  it("is exported on the StellarCred namespace", () => {
+    expect(StellarCred.verifyPreset).toBe(verifyPreset);
   });
 });

@@ -71,7 +71,6 @@ function makeConfig(sqlitePath: string): Config {
     rateLimitWindowMs: 60000,
     rateLimitMax: 120,
     rateLimitEnabled: true,
-    apiKey: undefined,
   };
 }
 
@@ -293,12 +292,15 @@ describe("GET /recent", () => {
       "GA2",
     ]);
 
+    // A newer claim arrives mid-pagination (belongs on a fresh page 1)…
     seed([{ wallet: "GANEW", verified_at: 6000, ledger_sequence: 60 }]);
+    // …and an older one arrives too (belongs after everything already seen).
     seed([{ wallet: "GA0", verified_at: 500, ledger_sequence: 5 }]);
 
     const page2 = await request(app).get(
       `/recent?limit=2&cursor=${encodeURIComponent(page1.body.nextCursor)}`
     );
+    // The already-fetched window is untouched: no duplicates, no skipped rows.
     expect(page2.body.claims.map((c: { wallet: string }) => c.wallet)).toEqual([
       "GA1",
       "GA0",
@@ -339,6 +341,7 @@ describe("GET /recent", () => {
 });
 
 // ── /issuers/:issuer/stats ───────────────────────────────────────────────────
+// Reputation stats for one issuer, derived entirely from indexed events (#398).
 
 describe("GET /issuers/:issuer/stats", () => {
   it("returns a zeroed row for an issuer with no indexed claims", async () => {
@@ -370,7 +373,7 @@ describe("GET /issuers/:issuer/stats", () => {
       wallet: "GA2",
       credential_type: "age",
       issuer: "GISSUER",
-      verified_at: 1000,
+      verified_at: 1000, // earlier than GA1's claim — should win as first_seen
       expiry: 9999999,
       ledger_sequence: 2,
       threshold: 21,
@@ -451,6 +454,7 @@ describe("CORS & Rate Limiting integration in API", () => {
     };
     const customApp = buildApp(db, makeIngester(), customConfig);
 
+    // GET request from allowed origin
     const getRes = await request(customApp)
       .get("/health")
       .set("Origin", "https://app.stellarcred.xyz");
@@ -459,6 +463,7 @@ describe("CORS & Rate Limiting integration in API", () => {
       "https://app.stellarcred.xyz"
     );
 
+    // OPTIONS preflight request
     const optRes = await request(customApp)
       .options("/claims")
       .set("Origin", "https://app.stellarcred.xyz")
@@ -492,6 +497,7 @@ describe("CORS & Rate Limiting integration in API", () => {
     };
     const customApp = buildApp(db, makeIngester(), customConfig);
 
+    // 3 allowed requests
     for (let i = 1; i <= 3; i++) {
       const res = await request(customApp)
         .get("/stats")
@@ -501,6 +507,7 @@ describe("CORS & Rate Limiting integration in API", () => {
       expect(res.headers["ratelimit-remaining"]).toBe(String(3 - i));
     }
 
+    // 4th request -> 429
     const throttled = await request(customApp)
       .get("/stats")
       .set("X-Forwarded-For", "203.0.113.50");
@@ -511,6 +518,7 @@ describe("CORS & Rate Limiting integration in API", () => {
       retryAfter: expect.any(Number),
     });
 
+    // Another IP is not throttled
     const otherIpRes = await request(customApp)
       .get("/stats")
       .set("X-Forwarded-For", "203.0.113.99");
@@ -519,9 +527,19 @@ describe("CORS & Rate Limiting integration in API", () => {
 });
 
 // ── Response schema (#349) ───────────────────────────────────────────────────
+// Pins the wire shape /claims and /recent claims are serialized to, and
+// specifically covers the cross-backend quirk that motivated it: `pg` parses
+// Postgres BIGINT columns as strings, while better-sqlite3 hands back plain
+// numbers for the same columns. serializeClaim is the one place that gets
+// normalized, so it's tested directly against a string-typed row (simulating
+// what the Postgres adapter's `pg.Pool` actually returns) rather than only
+// through the SQLite-backed integration tests below, which would never
+// exercise the string case at all.
 
 describe("claim response schema", () => {
   it("normalizes a Postgres-shaped row (BIGINT columns as strings) to numbers", () => {
+    // Mirrors exactly what `pg` hands back for BIGINT/BIGSERIAL columns —
+    // not what ClaimRow's TypeScript type declares, which is the point.
     const pgShapedRow = {
       id: "7",
       wallet: "GALICE",
@@ -635,183 +653,5 @@ describe("claim response schema", () => {
     expect(recentRes.status).toBe(200);
     expect(recentRes.body.claims).toHaveLength(1);
     expect(Object.keys(recentRes.body.claims[0]).sort()).toEqual(expectedKeys);
-  });
-});
-
-// ── Authentication (API_KEY) ───────────────────────────────────────────────────
-//
-// When API_KEY is set, /claims, /stats, and /recent require a matching token.
-// /health and /metrics are always public regardless of mode.
-
-const TEST_KEY = "test-secret-key-abc123";
-
-describe("authenticated mode (apiKey set)", () => {
-  let authApp: Application;
-
-  beforeEach(() => {
-    authApp = buildApp(db, makeIngester(), {
-      ...makeConfig(tmpFile),
-      apiKey: TEST_KEY,
-      rateLimitEnabled: false,
-    });
-  });
-
-  // /health and /metrics are always public — probes must not need credentials.
-
-  describe("GET /health", () => {
-    it("returns 200 without credentials", async () => {
-      const res = await request(authApp).get("/health");
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ status: "ok" });
-    });
-
-    it("returns 200 even when a wrong token is supplied", async () => {
-      const res = await request(authApp)
-        .get("/health")
-        .set("Authorization", "Bearer wrong-key");
-      expect(res.status).toBe(200);
-    });
-  });
-
-  describe("GET /metrics", () => {
-    it("returns 200 without credentials", async () => {
-      const res = await request(authApp).get("/metrics");
-      expect(res.status).toBe(200);
-    });
-  });
-
-  // Each guarded endpoint: missing / wrong / valid token.
-
-  describe("GET /claims", () => {
-    it("returns 401 with no credentials", async () => {
-      const res = await request(authApp).get("/claims?wallet=GALICE");
-      expect(res.status).toBe(401);
-      expect(res.body.error).toMatch(/authentication required/i);
-    });
-
-    it("returns 401 with a wrong Bearer token", async () => {
-      const res = await request(authApp)
-        .get("/claims?wallet=GALICE")
-        .set("Authorization", "Bearer wrong-key");
-      expect(res.status).toBe(401);
-      expect(res.body.error).toMatch(/invalid API key/i);
-    });
-
-    it("returns 401 with a wrong X-API-Key header", async () => {
-      const res = await request(authApp)
-        .get("/claims?wallet=GALICE")
-        .set("X-API-Key", "wrong-key");
-      expect(res.status).toBe(401);
-      expect(res.body.error).toMatch(/invalid API key/i);
-    });
-
-    it("returns 401 for a malformed Authorization header (no scheme)", async () => {
-      const res = await request(authApp)
-        .get("/claims?wallet=GALICE")
-        .set("Authorization", TEST_KEY);
-      expect(res.status).toBe(401);
-    });
-
-    it("returns 401 for unsupported auth scheme (Basic)", async () => {
-      const res = await request(authApp)
-        .get("/claims?wallet=GALICE")
-        .set("Authorization", `Basic ${Buffer.from("user:" + TEST_KEY).toString("base64")}`);
-      expect(res.status).toBe(401);
-    });
-
-    it("returns 200 with correct Bearer token", async () => {
-      const res = await request(authApp)
-        .get("/claims?wallet=GALICE")
-        .set("Authorization", `Bearer ${TEST_KEY}`);
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ wallet: "GALICE", claims: [] });
-    });
-
-    it("returns 200 with correct X-API-Key header", async () => {
-      const res = await request(authApp)
-        .get("/claims?wallet=GALICE")
-        .set("X-API-Key", TEST_KEY);
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ wallet: "GALICE", claims: [] });
-    });
-
-    it("auth is checked before wallet param validation (no wallet → 401, not 400)", async () => {
-      const res = await request(authApp).get("/claims");
-      expect(res.status).toBe(401);
-    });
-  });
-
-  describe("GET /stats", () => {
-    it("returns 401 with no credentials", async () => {
-      const res = await request(authApp).get("/stats");
-      expect(res.status).toBe(401);
-      expect(res.body.error).toMatch(/authentication required/i);
-    });
-
-    it("returns 401 with wrong token", async () => {
-      const res = await request(authApp)
-        .get("/stats")
-        .set("X-API-Key", "nope");
-      expect(res.status).toBe(401);
-    });
-
-    it("returns 200 with correct Bearer token", async () => {
-      const res = await request(authApp)
-        .get("/stats")
-        .set("Authorization", `Bearer ${TEST_KEY}`);
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ stats: [] });
-    });
-
-    it("returns 200 with correct X-API-Key header", async () => {
-      const res = await request(authApp)
-        .get("/stats")
-        .set("X-API-Key", TEST_KEY);
-      expect(res.status).toBe(200);
-    });
-  });
-
-  describe("GET /recent", () => {
-    it("returns 401 with no credentials", async () => {
-      const res = await request(authApp).get("/recent");
-      expect(res.status).toBe(401);
-      expect(res.body.error).toMatch(/authentication required/i);
-    });
-
-    it("returns 401 with wrong token", async () => {
-      const res = await request(authApp)
-        .get("/recent")
-        .set("Authorization", "Bearer totally-wrong");
-      expect(res.status).toBe(401);
-    });
-
-    it("returns 200 with correct Bearer token", async () => {
-      const res = await request(authApp)
-        .get("/recent")
-        .set("Authorization", `Bearer ${TEST_KEY}`);
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ claims: [], limit: 20, nextCursor: null });
-    });
-
-    it("returns 200 with correct X-API-Key header", async () => {
-      const res = await request(authApp)
-        .get("/recent")
-        .set("X-API-Key", TEST_KEY);
-      expect(res.status).toBe(200);
-    });
-  });
-});
-
-describe("public mode (no apiKey)", () => {
-  it("all claim endpoints are open without credentials", async () => {
-    // Verify that the default app (no apiKey) accepts requests without any token
-    const claims = await request(app).get("/claims?wallet=GUNKNOWN");
-    expect(claims.status).toBe(200);
-
-    const stats = await request(app).get("/stats");
-    expect(stats.status).toBe(200);
-
-    const recent = await request(app).get("/recent");
-    expect(recent.status).toBe(200);
   });
 });

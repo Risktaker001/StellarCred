@@ -36,12 +36,43 @@ function env(key: string, nextPublicKey?: string): string {
   );
 }
 
+// ── Single network selector (Issue #408) ─────────────────────────────────────
+// STELLARCRED_NETWORK / NEXT_PUBLIC_STELLAR_NETWORK (testnet | mainnet |
+// futurenet) picks a coherent preset for RPC URL and network passphrase.
+// Explicit URL/passphrase env vars override the preset.
+
+type StellarNetwork = "testnet" | "mainnet" | "futurenet";
+
+const NETWORK_PRESETS: Record<StellarNetwork, { rpcUrl: string; networkPassphrase: string }> = {
+  testnet: {
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  },
+  mainnet: {
+    rpcUrl: "https://soroban.stellar.org",
+    networkPassphrase: "Public Global Stellar Network ; September 2015",
+  },
+  futurenet: {
+    rpcUrl: "https://soroban-futurenet.stellar.org",
+    networkPassphrase: "Test SDF Future Network ; October 2022",
+  },
+};
+
+function parseNetwork(raw: string | undefined): StellarNetwork {
+  const key = (raw ?? "").trim().toLowerCase();
+  if (key === "public" || key === "main") return "mainnet";
+  if (key === "testnet" || key === "mainnet" || key === "futurenet") return key;
+  return "testnet";
+}
+
+const _preset = NETWORK_PRESETS[parseNetwork(env("STELLARCRED_NETWORK", "NEXT_PUBLIC_STELLAR_NETWORK"))];
+
 let _config = {
   registryId: env("STELLARCRED_REGISTRY_ID", "NEXT_PUBLIC_PROOF_REGISTRY_ID"),
-  rpcUrl: env("STELLARCRED_RPC_URL", "NEXT_PUBLIC_RPC_URL") || "https://soroban-testnet.stellar.org",
+  rpcUrl: env("STELLARCRED_RPC_URL", "NEXT_PUBLIC_RPC_URL") || _preset.rpcUrl,
   networkPassphrase:
     env("STELLARCRED_NETWORK_PASSPHRASE", "NEXT_PUBLIC_NETWORK_PASSPHRASE") ||
-    "Test SDF Network ; September 2015",
+    _preset.networkPassphrase,
   baseUrl: env("STELLARCRED_BASE_URL", "NEXT_PUBLIC_STELLARCRED_BASE_URL") || "https://stellarcred.xyz",
   requestTimeoutMs: 10_000,
   retries: 3,
@@ -179,6 +210,21 @@ export class ConfigError extends Error {
 }
 
 /**
+ * Error thrown when a wallet address is empty or is not a valid Stellar
+ * Ed25519 public key.
+ *
+ * In the default fail-soft path, public claim-read APIs return `false`, `null`,
+ * or `[]` for an invalid address. Pass `{ throwOnError: true }` to `hasClaim`
+ * / `getClaims` to surface this error to the caller.
+ */
+export class InvalidAddressError extends Error {
+  constructor(message = "Invalid Stellar address") {
+    super(message);
+    this.name = "InvalidAddressError";
+  }
+}
+
+/**
  * Error thrown when an RPC / contract-simulation call fails (network,
  * timeout at the transport layer, simulation error, etc.). Only surfaces
  * when `{ throwOnError: true }` is passed — distinguishing "couldn't check"
@@ -262,7 +308,7 @@ export interface Claim {
 // Low-level read: ProofRegistry.is_verified via simulation
 // ---------------------------------------------------------------------------
 
-import { Client as ProofRegistryClient } from "../../proof-registry/src/index.js";
+import { Client as ProofRegistryClient } from "../../proof-registry/src/index";
 import { configure as configureSharedClaims } from "./claims";
 
 type StellarSDK = typeof import("@stellar/stellar-sdk");
@@ -270,6 +316,28 @@ let _sdk: Promise<StellarSDK> | null = null;
 function getSdk(): Promise<StellarSDK> {
   if (!_sdk) _sdk = import("@stellar/stellar-sdk");
   return _sdk;
+}
+
+/**
+ * Normalize and validate a wallet before any on-chain read.
+ *
+ * This is intentionally performed before `getClient()` so malformed input
+ * cannot result in an RPC/client construction attempt.
+ */
+async function normalizeAndValidateWallet(wallet: string): Promise<string> {
+  const normalized = wallet.trim();
+
+  if (!normalized) {
+    throw new InvalidAddressError("Invalid Stellar address: address is empty");
+  }
+
+  const { StrKey } = await getSdk();
+
+  if (!StrKey.isValidEd25519PublicKey(normalized)) {
+    throw new InvalidAddressError("Invalid Stellar address");
+  }
+
+  return normalized;
 }
 
 // The client is stateless per config, so one instance is shared across every
@@ -479,8 +547,9 @@ async function readCheckClaim(
  * });
  *
  * @example
- * // Opt into typed errors — network failure throws RpcError, missing
- * // registryId throws ConfigError; "not verified" still returns false.
+ * // Opt into typed errors — invalid wallets throw InvalidAddressError,
+ * // network failure throws RpcError, missing registryId throws ConfigError;
+ * // "not verified" still returns false.
  * try {
  *   const ok = await hasClaim("G1ABC…", "kyc", { throwOnError: true });
  * } catch (err) {
@@ -499,9 +568,26 @@ export async function hasClaim(
 ): Promise<boolean> {
   warnIfMissingRegistryIdOnce();
   const throwOnError = opts?.throwOnError === true;
+
+  let normalizedWallet: string;
+  try {
+    normalizedWallet = await normalizeAndValidateWallet(wallet);
+  } catch (err) {
+    if (err instanceof InvalidAddressError) {
+      if (throwOnError) throw err;
+      return false;
+    }
+    // Loading the Stellar SDK itself failed. Treat this like the existing
+    // fail-soft/RPC path rather than misclassifying it as invalid input.
+    if (throwOnError) {
+      throw new RpcError("Failed to validate Stellar address", { cause: err });
+    }
+    return false;
+  }
+
   if (opts?.minThreshold !== undefined) {
     return readCheckClaim(
-      wallet,
+      normalizedWallet,
       claimType,
       opts.minThreshold,
       opts.trustedIssuers,
@@ -509,8 +595,9 @@ export async function hasClaim(
       opts.requestTimeoutMs,
     );
   }
+
   const r = await readIsVerified(
-    wallet,
+    normalizedWallet,
     claimType,
     opts?.trustedIssuers,
     throwOnError,
@@ -548,8 +635,16 @@ export async function getClaim(
   opts?: Pick<ClaimOptions, "trustedIssuers" | "requestTimeoutMs">,
 ): Promise<{ valid: boolean; verifiedAt: number; expiry: number } | null> {
   warnIfMissingRegistryIdOnce();
+
+  let normalizedWallet: string;
+  try {
+    normalizedWallet = await normalizeAndValidateWallet(wallet);
+  } catch {
+    return null;
+  }
+
   const r = await readIsVerified(
-    wallet,
+    normalizedWallet,
     claimType,
     opts?.trustedIssuers,
     false,
@@ -612,12 +707,24 @@ export async function hasClaims(
   const unique = Array.from(new Set(types));
   const results: Partial<Record<ClaimType, boolean>> = {};
 
+  let normalizedWallet: string;
+  try {
+    normalizedWallet = await normalizeAndValidateWallet(wallet);
+  } catch {
+    // Preserve the fail-soft batch contract: each requested type is false,
+    // and importantly no client/RPC read is attempted.
+    for (const type of unique) {
+      results[type] = false;
+    }
+    return results;
+  }
+
   await fanOut(unique, async (t) => {
     try {
       const minThreshold = opts?.minThresholds?.[t];
       if (minThreshold !== undefined) {
         results[t] = await readCheckClaim(
-          wallet,
+          normalizedWallet,
           t,
           minThreshold,
           opts?.trustedIssuers,
@@ -627,7 +734,7 @@ export async function hasClaims(
         return;
       }
       const r = await readIsVerified(
-        wallet,
+        normalizedWallet,
         t,
         opts?.trustedIssuers,
         false,
@@ -642,6 +749,60 @@ export async function hasClaims(
   return results;
 }
 
+/** One claim type + optional minimum threshold within a selective-disclosure preset (#386). */
+export interface PresetClaim {
+  type: ClaimType;
+  /** Same semantics as {@link ClaimOptions.minThreshold} — omit for a binary claim. */
+  minThreshold?: number;
+}
+
+/** Result of {@link verifyPreset}. */
+export interface PresetVerificationResult {
+  /** Per-type pass/fail, same shape {@link hasClaims} returns. */
+  results: Partial<Record<ClaimType, boolean>>;
+  /** True only if every claim in the preset passed. */
+  allValid: boolean;
+}
+
+/**
+ * Verifies every claim in a selective-disclosure preset — a holder-defined,
+ * shareable bundle like "Investor onboarding" (kyc + accreditation +
+ * jurisdiction) — against one wallet in a single batched call.
+ *
+ * This is a thin wrapper over {@link hasClaims}: presets themselves are not
+ * an on-chain concept (there is no preset registry), they're just a named,
+ * shareable list of `(type, minThreshold)` pairs a holder defines and a
+ * protocol requests out-of-band (e.g. via the deep link/QR the holder page
+ * generates) — verification is still exactly the same trustless on-chain
+ * `ProofRegistry` read every other claim check in this SDK uses.
+ *
+ * @example
+ * const { allValid, results } = await verifyPreset("G1ABC…", [
+ *   { type: "kyc" },
+ *   { type: "accreditation", minThreshold: 1_000_000 },
+ * ]);
+ * if (allValid) grantAccess();
+ */
+export async function verifyPreset(
+  wallet: string,
+  claims: readonly PresetClaim[],
+  opts?: Pick<BatchClaimOptions, "trustedIssuers" | "requestTimeoutMs">,
+): Promise<PresetVerificationResult> {
+  const types = claims.map((c) => c.type);
+  const minThresholds: Partial<Record<ClaimType, number>> = {};
+  for (const c of claims) {
+    if (c.minThreshold !== undefined) minThresholds[c.type] = c.minThreshold;
+  }
+
+  const results = await hasClaims(wallet, types, {
+    minThresholds,
+    trustedIssuers: opts?.trustedIssuers,
+    requestTimeoutMs: opts?.requestTimeoutMs,
+  });
+  const allValid = types.length > 0 && types.every((t) => results[t] === true);
+  return { results, allValid };
+}
+
 /**
  * Returns every active claim a wallet has proven, across all known credential
  * types. Useful for profile pages and protocol dashboards.
@@ -649,10 +810,10 @@ export async function hasClaims(
  * Uses the same batched fan-out as {@link hasClaims}, so all types are read
  * through one shared client.
  *
- * Pass `{ throwOnError: true }` to surface {@link ConfigError} / {@link RpcError}
- * instead of silently dropping failed reads. When `throwOnError` is set, a
- * single failing claim type rejects the whole batch (fail-fast) and discards
- * successful reads for other types.
+ * Pass `{ throwOnError: true }` to surface {@link InvalidAddressError},
+ * {@link ConfigError} / {@link RpcError} instead of silently dropping failed
+ * reads. When `throwOnError` is set, a single failing claim type rejects the
+ * whole batch (fail-fast) and discards successful reads for other types.
  */
 export async function getClaims(
   wallet: string,
@@ -660,13 +821,28 @@ export async function getClaims(
 ): Promise<Claim[]> {
   warnIfMissingRegistryIdOnce();
   const throwOnError = opts?.throwOnError === true;
+
+  let normalizedWallet: string;
+  try {
+    normalizedWallet = await normalizeAndValidateWallet(wallet);
+  } catch (err) {
+    if (err instanceof InvalidAddressError) {
+      if (throwOnError) throw err;
+      return [];
+    }
+    if (throwOnError) {
+      throw new RpcError("Failed to validate Stellar address", { cause: err });
+    }
+    return [];
+  }
+
   const results = await fanOut(CLAIM_TYPES, async (t) => {
     // Same isolation as `hasClaims` when fail-soft: `readIsVerified` swallows
     // read errors, but its own `getClient()` await can still reject (a failed
     // SDK import), which would otherwise reject the whole fan-out.
     try {
       const r = await readIsVerified(
-        wallet,
+        normalizedWallet,
         t,
         undefined,
         throwOnError,
@@ -757,6 +933,52 @@ export function buildVerifyUrl(options: {
     }
   }
   return url.toString();
+}
+
+/**
+ * Build a shareable embed URL for the StellarCred public verification badge.
+ *
+ * @example
+ * const url = buildBadgeUrl({
+ *   wallet: "G1ABC…",
+ *   claim: "kyc",
+ *   theme: "dark",
+ * });
+ */
+export function buildBadgeUrl(options: {
+  wallet: string;
+  claim: string;
+  theme?: "dark" | "light" | "auto";
+  compact?: boolean;
+  baseUrl?: string;
+}): string {
+  const base = options.baseUrl ?? _config.baseUrl;
+  const url = new URL("/badge", base);
+  url.searchParams.set("wallet", options.wallet);
+  url.searchParams.set("claim", options.claim);
+  if (options.theme && options.theme !== "auto") {
+    url.searchParams.set("theme", options.theme);
+  }
+  if (options.compact) {
+    url.searchParams.set("compact", "1");
+  }
+  return url.toString();
+}
+
+/**
+ * Generate an HTML <iframe> embed code snippet for the verification badge.
+ */
+export function buildBadgeEmbedCode(options: {
+  wallet: string;
+  claim: string;
+  theme?: "dark" | "light" | "auto";
+  compact?: boolean;
+  baseUrl?: string;
+}): string {
+  const src = buildBadgeUrl(options);
+  const width = options.compact ? "180" : "260";
+  const height = options.compact ? "36" : "54";
+  return `<iframe src="${src}" width="${width}" height="${height}" frameborder="0" scrolling="no" style="border:none;overflow:hidden;border-radius:8px;" title="StellarCred Verification Badge"></iframe>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -954,12 +1176,16 @@ export const StellarCred = {
   getClaim,
   hasClaims,
   getClaims,
+  verifyPreset,
   buildVerifyUrl,
+  buildBadgeUrl,
+  buildBadgeEmbedCode,
   parseReturnParams,
   watchClaim,
   CLAIM_TYPES,
   TimeoutError,
   ConfigError,
+  InvalidAddressError,
   RpcError,
 };
 export default StellarCred;

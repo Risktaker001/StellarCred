@@ -6,24 +6,11 @@
  *     Defaults to same-origin / default-deny in production; http://localhost:3000 in dev.
  *   - Rate Limiting: Per-IP fixed-window rate limiting with 429 Too Many Requests
  *     and Retry-After header. Configurable via RATE_LIMIT_WINDOW_SECONDS and RATE_LIMIT_MAX.
- *   - Authentication / API Keys: Off by default. Set API_KEY to enable optional
- *     bearer-token / X-API-Key authentication on claim endpoints. When enabled:
- *       GET /claims, /stats, /recent  — require the key
- *       GET /health, /metrics         — always public (probes must not need creds)
- *     Omitting API_KEY leaves all endpoints public, preserving the default
- *     frictionless-composability model for public deployments.
- *     See services/indexer/README.md §Authentication and §Privacy trade-offs.
- *
- * Per-endpoint auth policy:
- *   GET /health              always public   (liveness / readiness probe)
- *   GET /metrics             always public   (scraping by monitoring stacks)
- *   GET /claims?wallet=G…    gated when API_KEY is set
- *   GET /stats               gated when API_KEY is set
- *   GET /recent?limit&cursor gated when API_KEY is set (highest enum surface)
- *   GET /issuers/:i/stats    always public   (aggregate, non-holder data)
- *   GET /apps                always public
- *   GET /apps/:id            always public
- *   POST /apps/submit        always public
+ *   - Authentication / API Keys: Public read endpoints do NOT require API keys.
+ *     The indexer only serves public, non-sensitive ledger state (claims, stats, recent events)
+ *     and contains no write endpoints or identity data. Keeping read access keyless ensures
+ *     frictionless composability for dApps, wallets, and community explorers.
+ *     Scraping and DoS risks are mitigated via per-IP rate limiting and CORS enforcement.
  *
  * Endpoints:
  *
@@ -92,7 +79,6 @@ import { parseCorsOrigins } from "./config";
 import { createCorsMiddleware } from "./cors";
 import { RateLimiter } from "./rate-limit";
 import type { RecentCursor } from "./db";
-import { requireAuth } from "./auth";
 
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
@@ -228,17 +214,13 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   app.locals["rateLimiter"] = rateLimiter;
   app.use(rateLimiter.middleware());
 
-  // ── Auth guard ───────────────────────────────────────────────────────────
-  // requireAuth(undefined) is a no-op — public mode, unchanged behaviour.
-  // requireAuth("secret") enforces Bearer / X-API-Key on guarded routes.
-  // Resolve from config object first, then fall back to process.env so that
-  // tests can pass the key directly without touching the environment.
-  const apiKey = config?.apiKey ?? process.env["API_KEY"]?.trim() || undefined;
-  const guard = requireAuth(apiKey);
-
   // ── GET /health ──────────────────────────────────────────────────────────
-  // Always public: readiness/liveness probes and monitoring must work without
-  // credentials regardless of auth mode.
+  // Exposes ingester lag so operators can alert when the indexer falls behind.
+  //
+  // status semantics:
+  //   "ok"       — consecutiveErrors === 0
+  //   "degraded" — last fetch failed but some succeeded before it
+  //   "error"    — 3+ consecutive failures (stale data, indexer likely stalled)
   app.get(
     "/health",
     asyncHandler(async (_req, res) => {
@@ -270,13 +252,24 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   );
 
   // ── GET /metrics ──────────────────────────────────────────────────────────
-  // Always public: monitoring stacks scrape this without credentials.
+  // Exposes Prometheus metrics for the indexer.
+  //   - indexer_events_processed_total: total events processed since start
+  //   - indexer_fetch_errors_total: total fetch errors since start
+  //   - indexer_uptime_seconds: uptime in seconds since start
+  //   - indexer_db_write_latency_seconds: latest tick DB write latency in seconds
+  //   - indexer_ledgers_behind_head: ledgers between head and last processed
+  //
+  // This endpoint is left public (no auth required) so monitoring stacks can
+  // scrape it, but it is separate from the claim API routes so it is not
+  // colliding with public dApp/wallet endpoints. If operators want to gate it,
+  // they can add a reverse-proxy or firewall rule in front of /metrics.
   app.get(
     "/metrics",
     asyncHandler(async (_req, res) => {
       const metrics = ingester.getMetrics();
       const lines: string[] = [];
 
+      // Events processed total
       lines.push(
         `# HELP indexer_events_processed_total Total number of events processed since the ingester started.`,
       );
@@ -285,6 +278,7 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
       );
       lines.push(`indexer_events_processed_total ${metrics.eventsProcessedTotal}`);
 
+      // Fetch errors total
       lines.push(
         `# HELP indexer_fetch_errors_total Total number of fetch errors (all retries exhausted) since start.`,
       );
@@ -293,6 +287,7 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
       );
       lines.push(`indexer_fetch_errors_total ${metrics.fetchErrorsTotal}`);
 
+      // Uptime in seconds
       lines.push(
         `# HELP indexer_uptime_seconds Uptime in seconds since the ingester started.`,
       );
@@ -301,6 +296,7 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
       );
       lines.push(`indexer_uptime_seconds ${metrics.uptimeSeconds}`);
 
+      // DB write latency in seconds
       lines.push(
         `# HELP indexer_db_write_latency_seconds Latest tick DB write latency in seconds.`,
       );
@@ -309,6 +305,7 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
       );
       lines.push(`indexer_db_write_latency_seconds ${metrics.dbWriteLatencySeconds}`);
 
+      // Ledgers behind head
       lines.push(
         `# HELP indexer_ledgers_behind_head Number of ledgers between network head and last processed ledger.`,
       );
@@ -353,8 +350,6 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   );
 
   // ── GET /recent?limit=20&cursor=<opaque> ──────────────────────────────────
-  // Gated when API_KEY is set: highest enumeration surface — a single caller
-  // can page through every verified wallet address by iterating pages.
   app.get(
     "/recent",
     guard,
@@ -364,6 +359,8 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
         ? DEFAULT_LIMIT
         : Math.min(rawLimit, MAX_LIMIT);
 
+      // Cursor is optional — omit it (or pass cursor=) to start at the newest
+      // claims. A malformed cursor is a client error, not silently page 1.
       const rawCursor = req.query["cursor"];
       let cursor: RecentCursor | null = null;
       if (rawCursor != null && String(rawCursor).trim() !== "") {
@@ -385,7 +382,11 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   );
 
   // ── GET /issuers/:issuer/stats ───────────────────────────────────────────
-  // Always public: aggregate issuer reputation data, same class as /stats.
+  // Reputation stats derived entirely from indexed events (#398) — how many
+  // credentials an issuer has issued, active vs revoked, which credential
+  // types they cover, and how long they've been indexed. Public: this is the
+  // same class of aggregate chain data /stats already exposes, just sliced
+  // by issuer instead of by credential_type.
   app.get(
     "/issuers/:issuer/stats",
     asyncHandler(async (req, res) => {
@@ -400,6 +401,7 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   );
 
   // ── GET /apps ────────────────────────────────────────────────────────────
+  // Returns all approved app submissions for the gallery.
   app.get(
     "/apps",
     asyncHandler(async (_req, res) => {
@@ -427,6 +429,7 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   );
 
   // ── POST /apps/submit ────────────────────────────────────────────────────
+  // Third parties submit their app for review.
   app.use("/apps", express.json({ limit: "16kb" }));
   app.post(
     "/apps/submit",

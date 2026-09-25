@@ -220,7 +220,8 @@ export function buildApp(db: Db, ingester: Ingester, config?: Partial<Config>): 
   // requireAuth("secret")  → enforces Bearer / X-API-Key on guarded routes.
   // Resolved from config first so tests can inject the key directly without
   // touching the environment.
-  const apiKey = config?.apiKey ?? process.env["API_KEY"]?.trim() || undefined;
+  const envApiKey = process.env["API_KEY"]?.trim();
+  const apiKey = config?.apiKey ?? (envApiKey || undefined);
   const guard = requireAuth(apiKey);
 
   // ── GET /health ──────────────────────────────────────────────────────────

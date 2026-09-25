@@ -48,7 +48,7 @@ fn main(
     assert(age_years >= age_threshold_years);
 
     // -- Verify Optional 3rd Credential if num_credentials == 3 ---------------
-    assert(num_credentials == 2 | num_credentials == 3);
+    assert((num_credentials == 2) | (num_credentials == 3));
     if num_credentials == 3 {
         assert(cred3_salt != 0);
         assert(Poseidon2::hash([cred3_value as Field, cred3_salt], 2) == cred3_commitment);

@@ -790,3 +790,158 @@ fn register_issuer_by_unmocked_admin_fails() {
     assert!(res.is_err());
     assert!(!client.is_valid_issuer(&issuer, &symbol_short!("kyc")));
 }
+
+// ── Admin rotation tests (#342) ──────────────────────────────────────────────
+
+#[test]
+fn admin_can_transfer_to_new_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup(&env);
+    let new_admin = Address::generate(&env);
+
+    // The old admin is currently the root admin.
+    assert_eq!(client.admin(), admin);
+
+    // Old admin transfers to new admin.
+    client.set_admin(&new_admin);
+
+    // New admin is now the root admin.
+    assert_eq!(client.admin(), new_admin);
+
+    // Old admin no longer holds the admin role.
+    assert!(!client.has_role(&symbol_short!("admin"), &admin));
+
+    // New admin now holds the admin role.
+    assert!(client.has_role(&symbol_short!("admin"), &new_admin));
+}
+
+#[test]
+fn admin_transfer_moves_roles_to_new_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup(&env);
+    let new_admin = Address::generate(&env);
+
+    // The admin role initially belongs to the deployer.
+    assert!(client.has_role(&symbol_short!("admin"), &admin));
+
+    // Transfer to new admin.
+    client.set_admin(&new_admin);
+
+    // Root admin + every role the old root held move to the new admin.
+    assert_eq!(client.admin(), new_admin);
+    assert!(!client.has_role(&symbol_short!("admin"), &admin));
+    assert!(client.has_role(&symbol_short!("admin"), &new_admin));
+}
+
+#[test]
+fn only_current_admin_can_rotate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup(&env);
+    let stranger = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    // A non-admin cannot rotate the admin.
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_admin(&new_admin);
+    assert!(res.is_err());
+}
+
+#[test]
+fn post_rotation_new_admin_can_perform_ops() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_old_admin, client) = setup(&env);
+    let new_admin = Address::generate(&env);
+
+    // Rotate to new admin.
+    client.set_admin(&new_admin);
+
+    // New admin can register an issuer.
+    let issuer = Address::generate(&env);
+    let pubkey = BytesN::from_array(&env, &[7u8; 64]);
+    let types = vec![&env, symbol_short!("kyc")];
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_issuer",
+                args: (issuer.clone(), pubkey.clone(), types.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .register_issuer(&issuer, &pubkey, &types);
+
+    assert!(client.is_valid_issuer(&issuer, &symbol_short!("kyc")));
+}
+
+#[test]
+fn post_rotation_old_admin_cannot_perform_ops() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (old_admin, client) = setup(&env);
+    let new_admin = Address::generate(&env);
+
+    // Rotate to new admin.
+    client.set_admin(&new_admin);
+
+    // Old admin can NO LONGER register an issuer.
+    let issuer = Address::generate(&env);
+    let pubkey = BytesN::from_array(&env, &[7u8; 64]);
+    let types = vec![&env, symbol_short!("kyc")];
+
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_issuer",
+                args: (issuer.clone(), pubkey.clone(), types.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_register_issuer(&issuer, &pubkey, &types);
+    assert!(res.is_err());
+}
+
+#[test]
+fn set_admin_emits_expected_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup(&env);
+    let new_admin = Address::generate(&env);
+
+    // Drain the initial setup events (none for IssuerRegistry setup).
+    let _ = env.events().all();
+
+    client.set_admin(&new_admin);
+
+    let all_events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(all_events.len(), 1);
+
+    let event = &all_events.get(0).unwrap();
+    assert_eq!(event.0, client.address);
+    // Topics should be ("iss_reg", "admin_rot")
+    let topics: (Symbol, Symbol) = <(Symbol, Symbol)>::try_from_val(&env, &event.1).unwrap();
+    assert_eq!(topics.0, symbol_short!("iss_reg"));
+    assert_eq!(topics.1, symbol_short!("admin_rot"));
+
+    // Event data should contain old_admin, new_admin, and changed_at.
+    let event_data: EventAdminChanged = EventAdminChanged::try_from_val(&env, &event.2).unwrap();
+    assert_eq!(event_data.old_admin, admin);
+    assert_eq!(event_data.new_admin, new_admin);
+    assert!(event_data.changed_at > 0);
+}

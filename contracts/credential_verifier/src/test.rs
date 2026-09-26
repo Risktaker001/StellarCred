@@ -1089,19 +1089,20 @@ fn set_admin_emits_expected_event() {
 
     c.set_admin(&new_admin);
 
-    let all_events = env.events().all().filter_by_contract(&c.address);
-    assert_eq!(all_events.len(), 1);
-
-    let event = &all_events.get(0).unwrap();
-    assert_eq!(event.0, c.address);
-    // Topics should be ("cred_ver", "admin_rot")
-    let topics: (Symbol, Symbol) = <(Symbol, Symbol)>::try_from_val(&env, &event.1).unwrap();
-    assert_eq!(topics.0, symbol_short!("cred_ver"));
-    assert_eq!(topics.1, symbol_short!("admin_rot"));
-
-    // Event data should contain old_admin, new_admin, and changed_at.
-    let event_data: EventAdminChanged = EventAdminChanged::try_from_val(&env, &event.2).unwrap();
-    assert_eq!(event_data.old_admin, admin);
-    assert_eq!(event_data.new_admin, new_admin);
-    assert!(event_data.changed_at > 0);
+    assert_eq!(
+        env.events().all().filter_by_contract(&c.address),
+        vec![
+            &env,
+            (
+                c.address.clone(),
+                (symbol_short!("cred_ver"), symbol_short!("admin_rot")).into_val(&env),
+                EventAdminChanged {
+                    old_admin: admin.clone(),
+                    new_admin: new_admin.clone(),
+                    changed_at: env.ledger().timestamp(),
+                }
+                .into_val(&env),
+            ),
+        ],
+    );
 }

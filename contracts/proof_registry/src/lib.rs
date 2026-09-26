@@ -606,12 +606,6 @@ impl ProofRegistry {
     ) {
         holder.require_auth();
         Self::ensure_not_paused(&env);
-
-        let verifier = VerifierClient::new(&env, &Self::verifier(&env));
-        if !verifier.verify_proof(&symbol_short!("aggregate"), &proof, &public_inputs, &None) {
-            panic_with_error!(&env, Error::VerificationFailed);
-        }
-
         let num = Self::read_u64_field(&public_inputs, AGG_FIELD_NUM_CREDENTIALS);
         if num != credential_types.len() as u64
             || num < 2
@@ -620,6 +614,11 @@ impl ProofRegistry {
             || expiries.len() != credential_types.len()
         {
             panic_with_error!(&env, Error::AggregateLayoutInvalid);
+        }
+
+        let verifier = VerifierClient::new(&env, &Self::verifier(&env));
+        if !verifier.verify_proof(&symbol_short!("aggregate"), &proof, &public_inputs, &None) {
+            panic_with_error!(&env, Error::VerificationFailed);
         }
 
         for expiry in expiries.iter() {

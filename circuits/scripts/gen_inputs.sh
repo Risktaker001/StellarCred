@@ -106,3 +106,30 @@ MERKLE_LINES=$(node "$SCRIPTS/merkle_tree.js" path $SM_VALUES --for $SM_MEMBER)
 echo "done. demo issuer public key:"
 node "$SCRIPTS/sign.js" --pubkey
 
+
+echo "aggregate_proof..."
+C_KYC=$(commit 42 7)
+C_AGE=$(commit 3650 12345)
+C_CRED3=$(commit 250000 99)
+
+{
+  echo "kyc_secret = \"42\""
+  echo "kyc_salt = \"7\""
+  echo "kyc_commitment = \"$C_KYC\""
+  node "$SCRIPTS/sign.js" "$C_KYC" | sed 's/^sig/kyc_sig/; s/^issuer/kyc_issuer/'
+
+  echo "age_date_of_birth = \"3650\""
+  echo "age_salt = \"12345\""
+  echo "age_commitment = \"$C_AGE\""
+  echo "age_current_date = \"20000\""
+  echo "age_threshold_years = \"18\""
+  node "$SCRIPTS/sign.js" "$C_AGE" | sed 's/^sig/age_sig/; s/^issuer/age_issuer/'
+
+  echo "cred3_value = \"250000\""
+  echo "cred3_salt = \"99\""
+  echo "cred3_commitment = \"$C_CRED3\""
+  echo "cred3_threshold = \"200000\""
+  node "$SCRIPTS/sign.js" "$C_CRED3" | sed 's/^sig/cred3_sig/; s/^issuer/cred3_issuer/'
+
+  echo "num_credentials = \"3\""
+} > "$ROOT/aggregate_proof/Prover.toml"

@@ -7,6 +7,7 @@ import {
   type ClaimParams,
 } from "@stellarcred/issuer";
 import { fetchIssuerPubkey } from "@/lib/issuer-registry";
+import { registerPendingInquiry, getInquiryResult } from "@/lib/persona-webhook";
 import { readJsonBody, bodyErrorResponse } from "../../../lib/request-limits";
 import {
   logger,
@@ -96,6 +97,7 @@ function personaHeaders() {
 async function createPersonaInquiry(
   templateId: string,
   redirectUri: string,
+  referenceId?: string,
 ): Promise<{ url: string; id: string }> {
   const res = await fetch(`${PERSONA_BASE}/inquiries`, {
     method: "POST",
@@ -105,6 +107,7 @@ async function createPersonaInquiry(
         attributes: {
           "inquiry-template-id": templateId,
           "redirect-uri": redirectUri,
+          ...(referenceId ? { "reference-id": referenceId } : {}),
         },
       },
     }),
@@ -569,7 +572,15 @@ async function executeRequest(
         const redirectUrl = returnUrl
           ? `${baseUrl}/verify?return_url=${encodeURIComponent(returnUrl)}`
           : `${baseUrl}/verify`;
-        const { url, id } = await createPersonaInquiry(templateId, redirectUrl);
+        const { url, id } = await createPersonaInquiry(templateId, redirectUrl, holder);
+        registerPendingInquiry(id, {
+          credentialTypes: credentialTypes as CredentialType[],
+          holder,
+          issuerId,
+          issuerName,
+          expiry,
+          claimParams,
+        });
         return sendResponse(
           NextResponse.json(
             { needsPersona: true, personaUrl: url, inquiryId: id },
@@ -577,7 +588,13 @@ async function executeRequest(
           ),
         );
       }
-      // Second request — user returned from Persona, verify the completed inquiry.
+      // Check if async webhook already produced signed credentials for this inquiry
+      const cachedResult = getInquiryResult(personaInquiryId);
+      if (cachedResult && cachedResult.status === "completed" && cachedResult.credentials) {
+        outcome = "success";
+        return sendResponse(NextResponse.json({ credentials: cachedResult.credentials }));
+      }
+      // Second request — user returned from Persona, verify the completed inquiry synchronously.
       const kyc = await resolvePersonaKYC(personaInquiryId);
       if (!kyc.ok) {
         logger.info(
